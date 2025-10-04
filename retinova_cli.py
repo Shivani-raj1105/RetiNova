@@ -1,39 +1,34 @@
-# retinova_cli.py
+#!/usr/bin/env python3
 """
-RetiNova CLI — robust terminal wrapper with strict interactive validation.
-
-Interactive mode now:
- - asks for model path (loop until valid file)
- - shows menu with 3 options and re-prompts until a valid choice is entered:
-     1) File path (loop until valid path)
-     2) Paste base64/data URL (loop until valid base64)
-     3) Read raw image bytes from stdin (use '-' as image arg when piping)
- - Also works with command-line args (model [image]) with validation loops when needed.
-
-Saves:
- - gradcam_overlay.png
- - gradcam_heatmap.png
+RetiNova CLI — terminal-only wrapper that:
+ - auto-uses default model (models/retinova_model.h5)
+ - prompts user for an image path (drag & drop works)
+ - runs full question bank per predicted condition (validated input)
+ - produces Grad-CAM++ overlay and heatmap saved beside the input image
+ - writes clickable file:// JSON report (retinova_results.json)
 """
 
 import os
 import sys
+import json
 import warnings
 import logging
-import base64
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 import cv2
 
-# Silence TF logs
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 warnings.filterwarnings("ignore")
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 logging.getLogger("absl").setLevel(logging.ERROR)
 
 
+DEFAULT_MODEL_PATH = "models/retinova_model.h5"
+CONF_THRESHOLD = 0.75  
+
 class RetiNovaCLI:
-    def __init__(self, model_path, img_size=(224, 224), conf_threshold=0.75):
+    def __init__(self, model_path=DEFAULT_MODEL_PATH, img_size=(224, 224), conf_threshold=CONF_THRESHOLD):
         self.img_size = img_size
         self.conf_threshold = float(conf_threshold)
 
@@ -51,13 +46,11 @@ class RetiNovaCLI:
         self.choice_map = {0: "Low", 1: "Mild", 2: "Moderate", 3: "High"}
         self.choice_conf_map = {"Low": 0.0, "Mild": 0.05, "Moderate": 0.1, "High": 0.2}
 
-        # load model defensively
         try:
             self.model = load_model(model_path, compile=False)
         except Exception as e:
             raise RuntimeError(f"Failed to load model from '{model_path}': {e}")
 
-        # find last conv-like layer robustly
         self.last_conv_layer_name = None
         try:
             for layer in reversed(self.model.layers):
@@ -73,7 +66,6 @@ class RetiNovaCLI:
         except Exception:
             self.last_conv_layer_name = None
 
-        # full risk question bank (same as before)
         self.risk_questions = {
             "AMD":[
                 ("Are you over 55 years old?", ["Under 55","55-64","65-74","75 or older"]),
@@ -142,7 +134,6 @@ class RetiNovaCLI:
             ]
         }
 
-    # ---- Image loaders ----
     def preprocess_image_from_path(self, img_path):
         bgr = cv2.imread(img_path)
         if bgr is None:
@@ -164,7 +155,6 @@ class RetiNovaCLI:
         batch = np.expand_dims(norm, axis=0)
         return batch, rgb.astype(np.uint8)
 
-    # ---- Prediction (defensive) ----
     def predict_condition(self, img_array):
         img_array = np.array(img_array, dtype=np.float32)
         if img_array.ndim == 3:
@@ -174,7 +164,6 @@ class RetiNovaCLI:
 
         if isinstance(preds, (list, tuple)):
             preds = preds[-1]
-
         preds = np.array(preds)
 
         if preds.ndim == 1:
@@ -187,17 +176,19 @@ class RetiNovaCLI:
             idx = int(np.argmax(preds[0]))
             conf = float(preds[0, idx])
 
-        condition = self.conditions[idx] if idx < len(self.conditions) else "Unknown"
+        condition = self.conditions[idx] if idx < len(self.conditions) else f"Class_{idx}"
         return condition, conf
 
-    # ---- Grad-CAM++ (defensive) ----
     def make_gradcam_plus_plus(self, img_array, img_rgb, alpha=0.4):
+        """
+        Returns: (overlay_rgb_uint8, heatmap_bgr_uint8 or None)
+        """
         try:
             img_np = np.array(img_array, dtype=np.float32)
             if img_np.ndim == 3:
                 img_np = np.expand_dims(img_np, axis=0)
         except Exception:
-            print("Grad-CAM++: could not coerce input to numpy array; skipping heatmap.")
+            print("Grad-CAM++: could not coerce input; skipping heatmap.")
             return img_rgb, None
 
         if self.last_conv_layer_name is None:
@@ -217,17 +208,21 @@ class RetiNovaCLI:
                     if isinstance(predictions, (list, tuple)):
                         predictions = predictions[-1]
 
-                    predictions = tf.convert_to_tensor(predictions)
-                    if predictions.shape.rank == 0:
+                    if tf.rank(predictions) == 0:
                         predictions = tf.reshape(predictions, (1, 1))
-                    elif predictions.shape.rank == 1:
+                    elif tf.rank(predictions) == 1:
                         predictions = tf.expand_dims(predictions, axis=0)
 
                     pred_index = tf.math.argmax(predictions[0])
-                    class_channel = tf.gather(predictions, tf.cast(pred_index, tf.int32), axis=1)
+                    class_channel = predictions[:, pred_index]
+
                 grads = tape1.gradient(class_channel, conv_outputs)
             second_derivative = tape2.gradient(grads, conv_outputs)
             del tape2
+
+            grads = grads[0]
+            second_derivative = second_derivative[0]
+            conv_outputs = conv_outputs[0]
 
             numerator = second_derivative
             denominator = 2.0 * second_derivative + tf.square(grads) + 1e-8
@@ -235,7 +230,7 @@ class RetiNovaCLI:
             alphas = tf.nn.relu(alphas)
 
             weights = tf.reduce_sum(tf.maximum(grads, 0.0) * alphas, axis=(0, 1))
-            conv_outputs = conv_outputs[0]
+
             heatmap = tf.reduce_sum(conv_outputs * weights, axis=-1)
             heatmap = tf.maximum(heatmap, 0.0)
 
@@ -246,17 +241,15 @@ class RetiNovaCLI:
 
             heatmap_uint8 = np.uint8(255 * heatmap.numpy())
             heatmap_resized = cv2.resize(heatmap_uint8, (img_rgb.shape[1], img_rgb.shape[0]), interpolation=cv2.INTER_CUBIC)
-            heatmap_color_bgr = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
-            heatmap_color_rgb = cv2.cvtColor(heatmap_color_bgr, cv2.COLOR_BGR2RGB)
-            overlay_rgb = cv2.addWeighted(img_rgb.astype(np.uint8), 0.6, heatmap_color_rgb, alpha, 0)
+            heatmap_bgr = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
+            heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+            overlay_rgb = cv2.addWeighted(img_rgb.astype(np.uint8), 0.6, heatmap_rgb, alpha, 0)
 
-            return overlay_rgb.astype(np.uint8), heatmap_color_bgr.astype(np.uint8)
+            return overlay_rgb.astype(np.uint8), heatmap_bgr.astype(np.uint8)
 
         except Exception as e:
             print("Grad-CAM++ failed:", e)
             return img_rgb, None
-
-    # ---- Risk questions ----
     def ask_risk_questions(self, condition, base_conf):
         questions = self.risk_questions.get(condition, [])
         answers = {}
@@ -264,19 +257,20 @@ class RetiNovaCLI:
             return base_conf, answers
 
         print("\nAnswer the following questions to adjust confidence:")
-        for i, (q, opts) in enumerate(questions):
+        for i,(q,opts) in enumerate(questions):
             print(f"\n{i+1}. {q}")
-            for j, opt in enumerate(opts):
+            for j,opt in enumerate(opts):
                 print(f"  {j}. {opt}")
             while True:
                 try:
-                    choice = int(input("Enter choice number: ").strip())
+                    choice_raw = input("Enter choice number: ").strip()
+                    choice = int(choice_raw)
                     if 0 <= choice < len(opts):
-                        answers[q] = self.choice_map.get(choice, "Low")
+                        answers[q] = self.choice_map.get(choice,"Low")
                         break
                     else:
                         print("Invalid number. Try again.")
-                except Exception:
+                except ValueError:
                     print("Invalid input. Enter a number.")
 
         final_conf = float(base_conf)
@@ -284,209 +278,131 @@ class RetiNovaCLI:
             final_conf = min(1.0, final_conf + float(self.choice_conf_map.get(ans, 0)))
         return final_conf, answers
 
-    # ---- Run pipeline helpers ----
     def run_with_path(self, img_path):
         batch, rgb = self.preprocess_image_from_path(img_path)
-        self._run_core(batch, rgb)
+        return self._run_core(batch, rgb, img_path)
 
-    def run_with_bytes(self, img_bytes):
+    def run_with_bytes(self, img_bytes, input_label="stdin_image"):
         batch, rgb = self.preprocess_image_from_bytes(img_bytes)
-        self._run_core(batch, rgb)
+        return self._run_core(batch, rgb, input_label)
 
-    def _run_core(self, batch, rgb):
+    def _run_core(self, batch, rgb, input_path_or_label):
         condition, base_conf = self.predict_condition(batch)
         print(f"\nPredicted Condition: {condition}")
-        print(f"Base Confidence: {base_conf * 100:.2f}%")
+        print(f"Base Confidence: {base_conf*100:.2f}%")
 
         final_conf, answers = self.ask_risk_questions(condition, base_conf)
 
         if final_conf < self.conf_threshold:
             label = "Normal Eye"
-            risk_note = f"AI confidence < {int(self.conf_threshold * 100)}%. Mostly normal, possible risk of {condition}."
+            risk_note = f"AI confidence < {int(self.conf_threshold*100)}%. The eye appears mostly normal. However, you might be at some risk of {condition}. Consider regular checkups."
         else:
             label = condition
             risk_note = None
 
         print(f"\nFinal Label: {label}")
-        print(f"Final Confidence: {final_conf * 100:.2f}%")
+        print(f"Final Confidence: {final_conf*100:.2f}%")
         if answers:
             print("\nAnswers given:")
-            for k, v in answers.items():
+            for k,v in answers.items():
                 print(f"  {k}: {v}")
         if risk_note:
             print("\nRisk Note:", risk_note)
 
         overlay_rgb, heatmap_bgr = self.make_gradcam_plus_plus(batch, rgb)
 
-        # save overlay
+        if os.path.exists(input_path_or_label):
+            input_abs = os.path.abspath(input_path_or_label)
+            in_dir = os.path.dirname(input_abs)
+            base = os.path.splitext(os.path.basename(input_abs))[0]
+        else:
+            in_dir = os.getcwd()
+            base = input_path_or_label.replace(os.sep, "_").replace(":", "")
+
+        overlay_name = f"{base}_gradcam_overlay.png"
+        heatmap_name = f"{base}_gradcam_heatmap.png"
+        overlay_path = os.path.join(in_dir, overlay_name)
+        heatmap_path = os.path.join(in_dir, heatmap_name)
+
         try:
-            overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
-            cv2.imwrite("gradcam_overlay.png", overlay_bgr)
-            print("\nGrad-CAM++ overlay saved as 'gradcam_overlay.png'")
+            cv2.imwrite(overlay_path, cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR))
+            print(f"\nGrad-CAM++ overlay saved as '{overlay_path}'")
         except Exception as e:
             print("Failed to save overlay:", e)
 
         if heatmap_bgr is not None:
             try:
-                cv2.imwrite("gradcam_heatmap.png", heatmap_bgr)
-                print("Grad-CAM++ heatmap saved as 'gradcam_heatmap.png'")
+                cv2.imwrite(heatmap_path, heatmap_bgr)
+                print(f"Grad-CAM++ heatmap saved as '{heatmap_path}'")
             except Exception as e:
                 print("Failed to save heatmap:", e)
+        else:
+            heatmap_path = None
 
+        def to_file_link(p):
+            if not p:
+                return None
+            p_abs = os.path.abspath(p)
+            return "file:///" + p_abs.replace(os.sep, "/")
 
-def read_stdin_bytes():
-    try:
-        data = sys.stdin.buffer.read()
-        return data
-    except Exception:
-        return None
-
-def decode_base64_maybe(s):
-    s = s.strip()
-    if s.startswith("data:"):
+        results = {
+            "model_path": os.path.abspath(self.model.optimizer._name) if hasattr(self.model, "optimizer") and self.model.optimizer is not None else os.path.abspath(DEFAULT_MODEL_PATH),
+            "input_image": to_file_link(os.path.abspath(input_path_or_label)) if os.path.exists(input_path_or_label) else None,
+            "predicted_condition": condition,
+            "base_confidence": float(base_conf),
+            "final_confidence": float(final_conf),
+            "final_label": label,
+            "risk_note": risk_note,
+            "answers": answers,
+            "gradcam_overlay_path": to_file_link(overlay_path),
+            "gradcam_heatmap_path": to_file_link(heatmap_path) if heatmap_path else None
+        }
+        out_json = os.path.join(in_dir, "retinova_results.json")
         try:
-            _, payload = s.split(",", 1)
-            return base64.b64decode(payload)
-        except Exception:
-            raise ValueError("Invalid data URL/base64 provided.")
-    else:
-        try:
-            clean = "".join(s.split())
-            return base64.b64decode(clean)
-        except Exception:
-            raise ValueError("Invalid base64 input.")
-
-def prompt_model_path_loop(default="models/retinova_model.h5"):
-    while True:
-        mp = input(f"Enter path to model (.h5) [default: {default}]: ").strip() or default
-        if os.path.exists(mp) and os.path.isfile(mp):
-            return mp
-        print(f"Model not found at '{mp}'. Please enter a valid model path.")
-
-def prompt_menu_choice_loop():
-    prompt = (
-        "\nChoose image input method (enter number):\n"
-        "  1) File path\n"
-        "  2) Paste base64/data URL\n"
-        "  3) Read raw image bytes from stdin (use '-' as image arg when piping)\n"
-        "Enter 1, 2 or 3: "
-    )
-    while True:
-        c = input(prompt).strip()
-        if c in ("1","2","3"):
-            return c
-        print("Invalid choice. Please enter 1, 2 or 3.")
-
-def prompt_image_path_loop():
-    while True:
-        ip = input("Enter path to image: ").strip()
-        if os.path.exists(ip) and os.path.isfile(ip):
-            return ip
-        print(f"Image not found at '{ip}'. Please enter a valid image path.")
-
-def prompt_base64_loop():
-    while True:
-        b64 = input("Paste base64 or data URL and press Enter:\n").strip()
-        try:
-            decoded = decode_base64_maybe(b64)
-            return decoded
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2)
+            print(f"\nJSON report saved to '{out_json}'")
         except Exception as e:
-            print("Invalid base64/data URL. Try again.")
+            print("Failed to write JSON report:", e)
+
+        return results
 def main():
-    if len(sys.argv) == 1:
-        model_path = prompt_model_path_loop()
-        choice = prompt_menu_choice_loop()
-        if choice == "1":
-            image_path = prompt_image_path_loop()
-            mode = "path"
-        elif choice == "2":
-            img_bytes = prompt_base64_loop()
-            mode = "bytes"
-        else:
-            print("\nYou selected stdin mode. To use it, you'll need to run the script with '-' as the image argument and pipe raw bytes.")
-            print("Example (Unix): cat test_eye.png | python retinova_cli.py <model.h5> -")
-            while True:
-                yn = input("Proceed with stdin mode now? (y/n): ").strip().lower()
-                if yn in ("y","yes"):
-                    image_path = "-"
-                    mode = "stdin"
-                    break
-                elif yn in ("n","no"):
-                    choice = prompt_menu_choice_loop()
-                    if choice == "1":
-                        image_path = prompt_image_path_loop()
-                        mode = "path"
-                        break
-                    elif choice == "2":
-                        img_bytes = prompt_base64_loop()
-                        mode = "bytes"
-                        break
-                    else:
-                        print("Stdin mode selected again; repeating prompt.")
-                else:
-                    print("Please answer y or n.")
-    elif len(sys.argv) == 2:
-        model_path = sys.argv[1]
-        if not os.path.exists(model_path):
-            print(f"Model not found at '{model_path}'.")
-            model_path = prompt_model_path_loop()
-        choice = prompt_menu_choice_loop()
-        if choice == "1":
-            image_path = prompt_image_path_loop()
-            mode = "path"
-        elif choice == "2":
-            img_bytes = prompt_base64_loop()
-            mode = "bytes"
-        else:
-            image_path = "-"
-            mode = "stdin"
-    else:
-        model_path = sys.argv[1]
-        raw_image_arg = sys.argv[2]
-        if not os.path.exists(model_path):
-            print(f"Model not found at '{model_path}'.")
-            model_path = prompt_model_path_loop()
-        if raw_image_arg == "-":
-            mode = "stdin"
-        elif os.path.exists(raw_image_arg):
-            image_path = raw_image_arg
-            mode = "path"
-        else:
-            try:
-                img_bytes = decode_base64_maybe(raw_image_arg)
-                mode = "bytes"
-            except Exception:
-                print(f"Image '{raw_image_arg}' not found and not valid base64.")
-                choice = prompt_menu_choice_loop()
-                if choice == "1":
-                    image_path = prompt_image_path_loop()
-                    mode = "path"
-                elif choice == "2":
-                    img_bytes = prompt_base64_loop()
-                    mode = "bytes"
-                else:
-                    image_path = "-"
-                    mode = "stdin"
+    model_path = DEFAULT_MODEL_PATH
     if not os.path.exists(model_path):
-        print(f"Model not found at '{model_path}'. Exiting.")
-        sys.exit(1)
-    pipeline = RetiNovaCLI(model_path)
-    try:
-        if mode == "path":
-            pipeline.run_with_path(image_path)
-        elif mode == "bytes":
-            pipeline.run_with_bytes(img_bytes)
-        elif mode == "stdin":
-            stdin_bytes = read_stdin_bytes()
-            if not stdin_bytes:
-                print("No data read from stdin. When piping, call (example Unix): cat image.png | python retinova_cli.py <model.h5> -")
-                sys.exit(1)
-            pipeline.run_with_bytes(stdin_bytes)
+        print(f"Model not found at default '{model_path}'. Provide model path as first arg.")
+        if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+            model_path = sys.argv[1]
         else:
-            print("Unknown mode. Exiting.")
+            print("Usage: python retinova_cli.py [model.h5] [image_path]")
             sys.exit(1)
-    except Exception as e:
-        print("Error during processing:", e)
+
+    arg_offset = 0
+    if len(sys.argv) >= 2 and os.path.exists(sys.argv[1]) and sys.argv[1].lower().endswith(".h5"):
+        model_path = sys.argv[1]
+        arg_offset = 1
+    pipeline = RetiNovaCLI(model_path=model_path)
+    image_arg = None
+    if len(sys.argv) > arg_offset + 1:
+        image_arg = sys.argv[arg_offset + 1]
+
+    if not image_arg:
+        image_arg = input("Enter path to image (drag & drop works): ").strip().strip('"').strip("'")
+    if image_arg == "-":
+        stdin_bytes = sys.stdin.buffer.read()
+        if not stdin_bytes:
+            print("No data read from stdin. Example to pipe on Unix: cat image.png | python retinova_cli.py -")
+            sys.exit(1)
+        pipeline.run_with_bytes(stdin_bytes, input_label="stdin_image")
+        return
+    if os.path.exists(image_arg) and os.path.isfile(image_arg):
+        pipeline.run_with_path(image_arg)
+        return
+    try:
+        b = base64.b64decode(image_arg)
+        pipeline.run_with_bytes(b, input_label="pasted_base64_image")
+        return
+    except Exception:
+        print("Input was not a file path and not valid base64. Please rerun and provide a valid image path (drag & drop works).")
         sys.exit(1)
 
 
